@@ -1,0 +1,29 @@
+# 3DDFA-V3 official-like Windows environment
+# Python: 3.8
+# Windows verified torch stack from 3DDFA-V3 README:
+#   torch==1.10.0+cu102
+#   torchvision==0.11.0+cu102
+#
+# Install:
+#   uv venv .venv-3ddfa --python 3.8
+#   .venv-3ddfa\Scripts\activate
+#   uv pip install -r env\requirements-3ddfa-official-py38-cu102-win.txt
+
+-f https://download.pytorch.org/whl/torch_stable.html
+
+torch==1.10.0+cu102
+torchvision==0.11.0+cu102
+torchaudio==0.10.0
+
+Pillow==10.3.0
+opencv-python==4.9.0.80
+torch-summary
+scipy
+scikit-image
+albumentations
+Ninja
+tqdm
+matplotlib
+imageio
+huggingface_hub
+Cython

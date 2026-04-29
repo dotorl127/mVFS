@@ -1,0 +1,20 @@
+# MVFS teacher v0 config
+workspace: workspace/person_x
+aligned_dir: workspace/person_x/source/aligned_dfljpg
+teacher_dir: workspace/person_x/teacher
+
+condition:
+  downsample: 8
+  expand: 0.18
+  landmark_overlay: true
+
+train:
+  pretrained: stabilityai/sd-turbo
+  image_size: 512
+  batch_size: 1
+  fp16: true
+  train_unet: false
+  lr: 1.0e-4
+  lambda_noise: 1.0
+  lambda_recon: 0.1
+  fixed_high_timestep: 999

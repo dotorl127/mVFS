@@ -1,0 +1,9 @@
+[project]
+name = "mvfs"
+version = "0.1.0"
+description = "Moon Video Face Swap environment skeleton"
+requires-python = ">=3.10,<3.11"
+dependencies = []
+
+[tool.uv]
+package = false
