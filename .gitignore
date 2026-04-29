@@ -2,3 +2,4 @@ weights/
 checkpoints/
 dataset/
 .venv
+.idea
