@@ -173,7 +173,8 @@ def make_soft_blur_condition(
     if blur_sigma > 0:
         blurred_full = cv2.GaussianBlur(blurred_full, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma)
 
-    mask_f = feather_mask(mask_bin, feather_sigma=feather_sigma)
+    # mask_f = feather_mask(mask_bin, feather_sigma=feather_sigma)
+    mask_f = np.clip(mask_bin.astype(np.float32) / 255, 0.0, 1.0)
     out = image_bgr.astype(np.float32) * (1.0 - mask_f[..., None]) \
         + blurred_full.astype(np.float32) * mask_f[..., None]
     out = np.clip(out, 0, 255).astype(np.uint8)
@@ -458,9 +459,9 @@ def build_parser():
     p.add_argument("--a2-name", default="A2", type=str)
     p.add_argument("--recursive", action="store_true")
 
-    p.add_argument("--downsample", default=32, type=int)
+    p.add_argument("--downsample", default=8, type=int)
     p.add_argument("--expand", default=0.20, type=float)
-    p.add_argument("--blur-sigma", default=2.0, type=float)
+    p.add_argument("--blur-sigma", default=2, type=float)
     p.add_argument("--feather-sigma", default=8.0, type=float)
     p.add_argument("--blur-whole-image", action="store_true")
     p.add_argument("--debug", action="store_true")

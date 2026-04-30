@@ -158,8 +158,7 @@ class MVFSTeacherSDTurbo(nn.Module):
         pose_dtype = next(self.pose_guider.parameters()).dtype
         pose_residual = self.pose_guider(
             condition.to(device=self.device_name, dtype=pose_dtype),
-            latent_hw=noisy_latents.shape[-2:],
-        ).to(dtype=noisy_latents.dtype)
+            latent_hw=noisy_latents.shape[-2:], ).to(dtype=noisy_latents.dtype)
         unet_input = noisy_latents + pose_residual
 
         with torch.no_grad():

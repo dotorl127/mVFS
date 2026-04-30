@@ -1,15 +1,17 @@
+
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
-import json, pickle, random
+import json, random
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from mvfs_common.dfljpg_utils import read_dfljpg_metadata
+from mvfs_common.blur_condition import mask_from_png_bytes, build_face_blur_condition_rgb
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
 def _read_image_rgb(path: str | Path, image_size: Optional[int] = None) -> torch.Tensor:
     img = cv2.imread(str(path), cv2.IMREAD_COLOR)
@@ -26,62 +28,57 @@ def _list_images(path: Path) -> List[Path]:
         return []
     return sorted([p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS])
 
-def read_dfljpg_metadata(path: str | Path) -> Dict[str, Any]:
-    data = Path(path).read_bytes()
-    if len(data) < 4 or data[:2] != b"\xff\xd8":
-        return {}
-    i = 2
-    while i + 4 <= len(data):
-        if data[i] != 0xFF:
-            i += 1
-            continue
-        marker = data[i + 1]
-        i += 2
-        if marker == 0xDA:
-            break
-        if marker in (0x01,) or 0xD0 <= marker <= 0xD9:
-            continue
-        if i + 2 > len(data):
-            break
-        seg_len = int.from_bytes(data[i:i + 2], "big")
-        if seg_len < 2 or i + seg_len > len(data):
-            break
-        seg_data = data[i + 2:i + seg_len]
-        i += seg_len
-        if marker == 0xEF:
-            try:
-                obj = pickle.loads(seg_data)
-                if isinstance(obj, dict):
-                    return obj
-            except Exception:
-                pass
-    return {}
-
 def load_projected_3ddfa_landmarks_2d(path: str | Path) -> Optional[np.ndarray]:
-    """
-    Current 3DDFA updater stores projected 2D landmarks here:
-        meta["mvfs"]["3ddfa_v3"]["landmarks"]
-    If top-level landmarks were replaced, fallback:
-        meta["landmarks"]
-    """
+    try:
+        meta = read_dfljpg_metadata(path)
+    except Exception:
+        return None
+    mvfs = meta.get('mvfs', {})
+    if isinstance(mvfs, dict):
+        td = mvfs.get('3ddfa_v3', {})
+        if isinstance(td, dict) and td.get('landmarks') is not None:
+            arr = np.asarray(td['landmarks'], dtype=np.float32)
+            if arr.ndim == 2 and arr.shape[0] >= 68 and arr.shape[1] >= 2:
+                return arr[:68, :2].astype(np.float32)
+    lm = meta.get('landmarks', None)
+    if lm is not None:
+        arr = np.asarray(lm, dtype=np.float32)
+        if arr.ndim == 2 and arr.shape[0] >= 68 and arr.shape[1] >= 2:
+            return arr[:68, :2].astype(np.float32)
+    return None
+
+def load_face_mask_from_dfljpg(path: str | Path, image_size: Optional[int] = None) -> Optional[np.ndarray]:
     try:
         meta = read_dfljpg_metadata(path)
     except Exception:
         return None
 
-    mvfs = meta.get("mvfs", {})
-    if isinstance(mvfs, dict):
-        td = mvfs.get("3ddfa_v3", {})
-        if isinstance(td, dict) and td.get("landmarks") is not None:
-            arr = np.asarray(td["landmarks"], dtype=np.float32)
-            if arr.ndim == 2 and arr.shape[0] >= 68 and arr.shape[1] >= 2:
-                return arr[:68, :2].astype(np.float32)
+    mvfs = meta.get("mvfs", {}) if isinstance(meta, dict) else {}
+    face_seg = mvfs.get("face_seg", {}) if isinstance(mvfs, dict) else {}
 
-    lm = meta.get("landmarks", None)
-    if lm is not None:
-        arr = np.asarray(lm, dtype=np.float32)
-        if arr.ndim == 2 and arr.shape[0] >= 68 and arr.shape[1] >= 2:
-            return arr[:68, :2].astype(np.float32)
+    # Preferred new format: sidecar PNG path relative to dataset root.
+    mask_path = face_seg.get("mask_path", None)
+    if mask_path:
+        img_path = Path(path)
+        # Expected current image path:
+        #   <dataset_root>/<person_id>/<A1 or A2>/frame_xxx.jpg
+        dataset_root = img_path.parent.parent.parent
+        full_mask_path = dataset_root / mask_path
+        if full_mask_path.exists():
+            mask = cv2.imread(str(full_mask_path), cv2.IMREAD_GRAYSCALE)
+            if mask is not None:
+                if image_size is not None and (mask.shape[0] != image_size or mask.shape[1] != image_size):
+                    mask = cv2.resize(mask, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+                return mask
+
+    # Backward compatibility with old inline PNG bytes if already present and small enough.
+    blob = face_seg.get("mask_png", None)
+    if blob is not None:
+        mask = mask_from_png_bytes(blob)
+        if image_size is not None and (mask.shape[0] != image_size or mask.shape[1] != image_size):
+            mask = cv2.resize(mask, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+        return mask
+
     return None
 
 def _draw_gaussian(heat: np.ndarray, x: float, y: float, sigma: float):
@@ -103,96 +100,59 @@ def _draw_polyline_heat(heat: np.ndarray, pts: np.ndarray, thickness: int = 2):
         cv2.polylines(tmp, [pts_i.reshape(-1, 1, 2)], False, 255, thickness, cv2.LINE_AA)
     heat[:] = np.maximum(heat, tmp.astype(np.float32) / 255.0)
 
-def render_landmark_condition(
-    landmarks: np.ndarray,
-    image_size: int,
-    mode: str = "single",
-    sigma: float = 2.0,
-    draw_lines: bool = True,
-) -> torch.Tensor:
+def render_landmark_condition(landmarks: np.ndarray, image_size: int, sigma: float = 2.0, draw_lines: bool = True) -> torch.Tensor:
     lm = np.asarray(landmarks, dtype=np.float32)
     h = w = int(image_size)
-
+    heat = np.zeros((h, w), np.float32)
     chains_all = [
         list(range(0, 17)), list(range(17, 22)), list(range(22, 27)),
         list(range(27, 31)), list(range(31, 36)),
         list(range(36, 42)) + [36], list(range(42, 48)) + [42],
         list(range(48, 60)) + [48], list(range(60, 68)) + [60],
     ]
-
-    if mode == "single":
-        heat = np.zeros((h, w), np.float32)
-        if draw_lines:
-            for ch in chains_all:
-                _draw_polyline_heat(heat, lm[ch, :2], thickness=max(1, int(round(sigma))))
-        for x, y in lm[:, :2]:
-            _draw_gaussian(heat, float(x), float(y), sigma)
-        return torch.from_numpy(np.clip(heat, 0, 1)[None].astype(np.float32))
-
-    if mode == "parts":
-        groups = [
-            (list(range(0, 17)), [list(range(0, 17))]),
-            (list(range(17, 27)) + list(range(36, 48)), [list(range(17, 22)), list(range(22, 27)), list(range(36, 42)) + [36], list(range(42, 48)) + [42]]),
-            (list(range(27, 36)), [list(range(27, 31)), list(range(31, 36))]),
-            (list(range(48, 68)), [list(range(48, 60)) + [48], list(range(60, 68)) + [60]]),
-        ]
-        maps = []
-        for idx, chains in groups:
-            heat = np.zeros((h, w), np.float32)
-            if draw_lines:
-                for ch in chains:
-                    _draw_polyline_heat(heat, lm[ch, :2], thickness=max(1, int(round(sigma))))
-            for x, y in lm[idx, :2]:
-                _draw_gaussian(heat, float(x), float(y), sigma)
-            maps.append(np.clip(heat, 0, 1))
-        return torch.from_numpy(np.stack(maps, axis=0).astype(np.float32))
-
-    raise ValueError(f"Unknown landmark_map_mode={mode}")
+    if draw_lines:
+        for ch in chains_all:
+            _draw_polyline_heat(heat, lm[ch, :2], thickness=max(1, int(round(sigma))))
+    for x, y in lm[:, :2]:
+        _draw_gaussian(heat, float(x), float(y), sigma)
+    return torch.from_numpy(np.clip(heat, 0, 1)[None].astype(np.float32))
 
 class TeacherBlurDataset(Dataset):
-    """
-    Returns:
-      clean         : 3ch RGB [-1,1]
-      condition     : blur RGB + projected 3DDFA landmark map
-                      default 4ch = 3 + 1
-      condition_rgb : 3ch blur RGB only, for debug
-      landmark_map  : [0,1] map, for debug
-      identity      : A1 image
-      id_embed      : cached A1 average ID embedding
-    """
     def __init__(
         self,
         index_path: str | Path,
         image_size: int = 512,
         random_identity_same_dir: bool = False,
-        use_landmark_condition: bool = True,
-        landmark_map_mode: str = "single",
         landmark_sigma: float = 2.0,
         landmark_draw_lines: bool = True,
+        blur_downsample_size: int = 8,
+        blur_gaussian_radius: float = 8.0,
+        blur_feather_sigma: float = 0.0,
     ):
         self.index_path = Path(index_path)
         self.image_size = int(image_size)
         self.random_identity_same_dir = random_identity_same_dir
-        self.use_landmark_condition = use_landmark_condition
-        self.landmark_map_mode = landmark_map_mode
         self.landmark_sigma = float(landmark_sigma)
         self.landmark_draw_lines = landmark_draw_lines
-
+        self.blur_downsample_size = int(blur_downsample_size)
+        self.blur_gaussian_radius = float(blur_gaussian_radius)
+        self.blur_feather_sigma = float(blur_feather_sigma)
         self.rows = []
-        with open(self.index_path, "r", encoding="utf-8") as f:
+        with open(self.index_path, 'r', encoding='utf-8') as f:
             for line in f:
                 if line.strip():
                     self.rows.append(json.loads(line))
         if not self.rows:
-            raise ValueError(f"Empty index: {self.index_path}")
+            raise ValueError(f'Empty index: {self.index_path}')
 
-    def __len__(self): return len(self.rows)
+    def __len__(self):
+        return len(self.rows)
 
     def _infer_identity_path(self, row: Dict[str, Any]) -> str:
-        if row.get("identity_path"):
-            return row["identity_path"]
-        clean_path = Path(row["clean_path"])
-        a1_dir = clean_path.parent.parent / "A1"
+        if row.get('identity_path'):
+            return row['identity_path']
+        clean_path = Path(row['clean_path'])
+        a1_dir = clean_path.parent.parent / 'A1'
         imgs = _list_images(a1_dir)
         if imgs:
             return str(random.choice(imgs) if self.random_identity_same_dir else imgs[0])
@@ -200,55 +160,62 @@ class TeacherBlurDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = dict(self.rows[idx])
-        clean_path = row["clean_path"]
-        cond_path = row["condition_path"]
+        clean_path = row['clean_path']
         identity_path = self._infer_identity_path(row)
 
-        clean = _read_image_rgb(clean_path, self.image_size)
-        condition_rgb = _read_image_rgb(cond_path, self.image_size)
+        clean_bgr = cv2.imread(str(clean_path), cv2.IMREAD_COLOR)
+        if clean_bgr is None:
+            raise FileNotFoundError(clean_path)
+        if clean_bgr.shape[:2] != (self.image_size, self.image_size):
+            clean_bgr = cv2.resize(clean_bgr, (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+
+        face_mask = load_face_mask_from_dfljpg(clean_path, image_size=self.image_size)
+        if face_mask is None:
+            face_mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
+        cond_rgb = build_face_blur_condition_rgb(
+            clean_bgr,
+            face_mask,
+            downsample_size=self.blur_downsample_size,
+            gaussian_radius=self.blur_gaussian_radius,
+            feather_sigma=self.blur_feather_sigma,
+        )
+
+        clean = torch.from_numpy(cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).permute(2,0,1).contiguous() * 2.0 - 1.0
+        condition_rgb = torch.from_numpy(cond_rgb.astype(np.float32) / 255.0).permute(2,0,1).contiguous() * 2.0 - 1.0
         identity = _read_image_rgb(identity_path, self.image_size)
 
-        if self.use_landmark_condition:
-            lm = load_projected_3ddfa_landmarks_2d(clean_path)
-            ch = 4 if self.landmark_map_mode == "parts" else 1
-            if lm is None:
-                landmark_map = torch.zeros((ch, self.image_size, self.image_size), dtype=torch.float32)
-            else:
-                img0 = cv2.imread(str(clean_path), cv2.IMREAD_COLOR)
-                if img0 is not None:
-                    h0, w0 = img0.shape[:2]
-                    lm = lm.copy()
-                    lm[:, 0] *= float(self.image_size) / float(w0)
-                    lm[:, 1] *= float(self.image_size) / float(h0)
-                landmark_map = render_landmark_condition(
-                    lm,
-                    image_size=self.image_size,
-                    mode=self.landmark_map_mode,
-                    sigma=self.landmark_sigma,
-                    draw_lines=self.landmark_draw_lines,
-                )
-            condition = torch.cat([condition_rgb, landmark_map * 2.0 - 1.0], dim=0)
-        else:
+        lm = load_projected_3ddfa_landmarks_2d(clean_path)
+        if lm is None:
             landmark_map = torch.zeros((1, self.image_size, self.image_size), dtype=torch.float32)
-            condition = condition_rgb
+        else:
+            img0 = cv2.imread(str(clean_path), cv2.IMREAD_COLOR)
+            if img0 is not None:
+                h0, w0 = img0.shape[:2]
+                lm = lm.copy()
+                lm[:, 0] *= float(self.image_size) / float(w0)
+                lm[:, 1] *= float(self.image_size) / float(h0)
+            landmark_map = render_landmark_condition(lm, self.image_size, sigma=self.landmark_sigma, draw_lines=self.landmark_draw_lines)
+
+        condition = torch.cat([condition_rgb, landmark_map * 2.0 - 1.0], dim=0)
+        face_mask_t = torch.from_numpy(face_mask.astype(np.float32) / 255.0)[None]
 
         sample = {
-            "clean": clean,
-            "condition": condition,
-            "condition_rgb": condition_rgb,
-            "landmark_map": landmark_map,
-            "identity": identity,
-            "clean_path": clean_path,
-            "condition_path": cond_path,
-            "identity_path": identity_path,
-            "person_id": row.get("person_id", ""),
+            'clean': clean,
+            'condition': condition,
+            'condition_rgb': condition_rgb,
+            'landmark_map': landmark_map,
+            'face_mask': face_mask_t,
+            'identity': identity,
+            'clean_path': clean_path,
+            'identity_path': identity_path,
+            'person_id': row.get('person_id', ''),
         }
 
-        id_embed_path = row.get("id_embed_path")
+        id_embed_path = row.get('id_embed_path')
         if id_embed_path:
             arr = np.load(id_embed_path)
             if isinstance(arr, np.lib.npyio.NpzFile):
-                arr = arr["embedding"]
-            sample["id_embed"] = torch.from_numpy(np.asarray(arr, dtype=np.float32))
-            sample["id_embed_path"] = id_embed_path
+                arr = arr['embedding']
+            sample['id_embed'] = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+            sample['id_embed_path'] = id_embed_path
         return sample
