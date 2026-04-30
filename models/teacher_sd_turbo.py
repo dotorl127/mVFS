@@ -26,11 +26,14 @@ class MVFSTeacherSDTurbo(nn.Module):
     """
     SD-Turbo based MVFS teacher.
 
-    This version keeps the training loss/hyperparameters controlled by train_teacher.py.
-    Fixes only implementation bugs:
-      - fp16 condition vs fp32 PoseGuider dtype mismatch
-      - fp16 id_embed vs fp32 IDAdapter dtype mismatch
-      - unstable manual pred_x0 formula replaced by diffusers scheduler.step()
+    Important mixed-precision rule:
+      - Frozen VAE/TextEncoder may run in fp16.
+      - Trainable UNet/PoseGuider/IDAdapter must keep fp32 parameters.
+      - Autocast may still run many ops in fp16.
+      - GradScaler cannot unscale fp16 parameter gradients.
+
+    This fixes:
+      ValueError: Attempting to unscale FP16 gradients.
     """
 
     def __init__(
@@ -48,9 +51,13 @@ class MVFSTeacherSDTurbo(nn.Module):
         except Exception as e:
             raise ImportError("Install diffusers/transformers/accelerate to use MVFSTeacherSDTurbo") from e
 
+        # If full UNet is trainable, load weights as fp32.
+        # Mixed precision should be done by autocast, not by storing trainable weights in fp16.
+        load_dtype = torch.float32 if train_unet else dtype
+
         pipe = AutoPipelineForText2Image.from_pretrained(
             pretrained_model_name_or_path,
-            torch_dtype=dtype,
+            torch_dtype=load_dtype,
             safety_checker=None,
         )
 
@@ -62,6 +69,7 @@ class MVFSTeacherSDTurbo(nn.Module):
 
         self.device_name = device
         self.weight_dtype = dtype
+        self.train_unet_flag = train_unet
 
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
@@ -71,12 +79,24 @@ class MVFSTeacherSDTurbo(nn.Module):
         self.pose_guider = PoseGuider(in_channels=3, out_channels=self.unet.config.in_channels)
         self.id_adapter = IDAdapter(id_dim=id_dim, cross_attention_dim=cross_dim, num_tokens=num_id_tokens)
 
+        # Move to device first.
         self.to(device)
 
-        # Keep new modules in fp32 unless the caller explicitly casts them.
-        # This is safer and avoids Conv bias half/float mismatch.
-        self.pose_guider.float()
-        self.id_adapter.float()
+        # Frozen modules can be fp16 for VRAM.
+        if dtype == torch.float16:
+            self.vae.to(device=device, dtype=torch.float16)
+            self.text_encoder.to(device=device, dtype=torch.float16)
+
+        # Trainable modules must be fp32 when GradScaler/autocast is used.
+        self.pose_guider.to(device=device, dtype=torch.float32)
+        self.id_adapter.to(device=device, dtype=torch.float32)
+
+        if train_unet:
+            self.unet.to(device=device, dtype=torch.float32)
+            self.unet.train()
+        else:
+            self.unet.to(device=device, dtype=dtype)
+            self.unet.eval()
 
     @torch.no_grad()
     def encode_prompt(self, batch_size: int, prompt: str = "") -> torch.Tensor:
@@ -92,15 +112,17 @@ class MVFSTeacherSDTurbo(nn.Module):
 
     @torch.no_grad()
     def encode_images(self, images: torch.Tensor) -> torch.Tensor:
-        images = images.to(device=self.device_name, dtype=self.weight_dtype)
+        vae_dtype = next(self.vae.parameters()).dtype
+        images = images.to(device=self.device_name, dtype=vae_dtype)
         latents = self.vae.encode(images).latent_dist.sample()
         return latents * self.vae.config.scaling_factor
 
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        # Decode path is used for recon/debug. Guard only against invalid numeric values.
         latents = torch.nan_to_num(latents.float(), nan=0.0, posinf=30.0, neginf=-30.0)
         latents = latents.clamp(-30.0, 30.0)
-        z = (latents / self.vae.config.scaling_factor).to(device=self.device_name, dtype=self.weight_dtype)
+
+        vae_dtype = next(self.vae.parameters()).dtype
+        z = (latents / self.vae.config.scaling_factor).to(device=self.device_name, dtype=vae_dtype)
         img = self.vae.decode(z).sample
         img = torch.nan_to_num(img.float(), nan=0.0, posinf=1.0, neginf=-1.0)
         return img.clamp(-1, 1)
@@ -126,10 +148,6 @@ class MVFSTeacherSDTurbo(nn.Module):
         raise ValueError(f"Unsupported prediction_type: {pred_type}")
 
     def predict_x0(self, noisy_latents: torch.Tensor, model_pred: torch.Tensor, timesteps: torch.Tensor) -> Optional[torch.Tensor]:
-        """
-        Use diffusers scheduler.step() instead of manual epsilon-only equation.
-        This handles epsilon/v_prediction/sample according to scheduler config.
-        """
         outs = []
         for i in range(noisy_latents.shape[0]):
             step_out = self.scheduler.step(
@@ -139,6 +157,7 @@ class MVFSTeacherSDTurbo(nn.Module):
                 return_dict=True,
             )
             outs.append(step_out.pred_original_sample)
+
         pred_x0 = torch.cat(outs, dim=0)
         pred_x0 = torch.nan_to_num(pred_x0.float(), nan=0.0, posinf=30.0, neginf=-30.0)
         return pred_x0.clamp(-30.0, 30.0).to(dtype=noisy_latents.dtype)
@@ -185,13 +204,24 @@ class MVFSTeacherSDTurbo(nn.Module):
         unet_input = noisy_latents + pose_residual
 
         with torch.no_grad():
-            prompt_embeds = self.encode_prompt(b, prompt=prompt).to(dtype=self.weight_dtype)
+            text_dtype = next(self.text_encoder.parameters()).dtype
+            prompt_embeds = self.encode_prompt(b, prompt=prompt).to(dtype=text_dtype)
         prompt_embeds = self.append_id_tokens(prompt_embeds, id_embed)
 
-        model_pred = self.unet(unet_input, timesteps, encoder_hidden_states=prompt_embeds).sample
-        target = self._prediction_target(latents, noise, timesteps)
+        # If UNet weights are fp32, keep inputs/embeds compatible.
+        # Autocast in train_teacher.py will still use tensor cores where possible.
+        unet_dtype = next(self.unet.parameters()).dtype
+        if unet_dtype == torch.float32:
+            unet_input = unet_input.float()
+            prompt_embeds = prompt_embeds.float()
+        else:
+            unet_input = unet_input.to(dtype=unet_dtype)
+            prompt_embeds = prompt_embeds.to(dtype=unet_dtype)
 
-        pred_x0 = self.predict_x0(noisy_latents, model_pred, timesteps) if decode_recon else None
+        model_pred = self.unet(unet_input, timesteps, encoder_hidden_states=prompt_embeds).sample
+        target = self._prediction_target(latents, noise, timesteps).to(dtype=model_pred.dtype)
+
+        pred_x0 = self.predict_x0(noisy_latents.to(dtype=model_pred.dtype), model_pred, timesteps) if decode_recon else None
         recon_image = self.decode_latents(pred_x0) if pred_x0 is not None else None
 
         return TeacherOutput(
