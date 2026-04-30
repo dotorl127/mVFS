@@ -1,19 +1,21 @@
 @echo off
 setlocal
 
-rem MVFS teacher full UNet train with late ID loss.
-rem ID loss backend: facenet-pytorch InceptionResnetV1(vggface2), chosen for RTX 3060 12GB.
+rem MVFS teacher full UNet train with:
+rem - blur RGB
+rem - projected 3DDFA landmark heatmap condition
+rem - late FaceNet ID loss
 rem Usage:
-rem   bat\26_teacher_train_late_idloss_facenet.bat <teacher_workspace> <run_name>
+rem   bat\26_teacher_train_late_idloss_lmcond.bat <teacher_workspace> <run_name>
 
 set "WS=%~1"
 set "RUN_NAME=%~2"
 
 if "%WS%"=="" (
-    echo Usage: bat\26_teacher_train_late_idloss_facenet.bat ^<teacher_workspace^> ^<run_name^>
+    echo Usage: bat\26_teacher_train_late_idloss_lmcond.bat ^<teacher_workspace^> ^<run_name^>
     exit /b 1
 )
-if "%RUN_NAME%"=="" set "RUN_NAME=late_idloss_facenet_run01"
+if "%RUN_NAME%"=="" set "RUN_NAME=late_idloss_lmcond_run01"
 
 call "%~dp0_mvfs_activate.bat"
 if not %errorlevel%==0 exit /b 1
@@ -38,6 +40,9 @@ python "%MVFS_ROOT%\train\train_teacher.py" ^
   --fp16 ^
   --train-unet ^
   --gradient-checkpointing ^
+  --condition-channels 4 ^
+  --landmark-map-mode single ^
+  --landmark-sigma 2.0 ^
   --id-dim 512 ^
   --num-id-tokens 4 ^
   --fixed-high-timestep 999 ^
