@@ -11,4 +11,6 @@ python "%MVFS_ROOT%\tools\download_mvfs_pretrained.py" ^
   --sd-turbo ^
   --insightface-buffalo-l
 
+uv pip install facenet-pytorch --no-deps
+
 endlocal

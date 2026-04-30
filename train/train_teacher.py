@@ -5,7 +5,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -20,25 +19,43 @@ if str(ROOT) not in sys.path:
 from datasets.teacher_blur_dataset import TeacherBlurDataset
 from models.teacher_sd_turbo import MVFSTeacherSDTurbo
 from losses.diffusion_losses import noise_prediction_loss, reconstruction_l1_loss
+from losses.id_loss import build_id_loss
 
 
 def save_checkpoint(model: MVFSTeacherSDTurbo, out_dir: Path, step: int):
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    train_unet = any(p.requires_grad for p in model.unet.parameters())
     ckpt = {
         "pose_guider": model.pose_guider.state_dict(),
         "id_adapter": model.id_adapter.state_dict(),
+        "unet": model.unet.state_dict() if train_unet else None,
         "step": step,
+        "train_unet": train_unet,
     }
-    torch.save(ckpt, ckpt_dir / f"teacher_adapters_step_{step:07d}.pt")
+    torch.save(ckpt, ckpt_dir / f"teacher_step_{step:07d}.pt")
+
+
+def load_checkpoint(model: MVFSTeacherSDTurbo, ckpt_path: str | Path):
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(ckpt_path)
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+
+    if ckpt.get("pose_guider") is not None:
+        model.pose_guider.load_state_dict(ckpt["pose_guider"], strict=True)
+    if ckpt.get("id_adapter") is not None:
+        model.id_adapter.load_state_dict(ckpt["id_adapter"], strict=True)
+    if ckpt.get("unet") is not None:
+        model.unet.load_state_dict(ckpt["unet"], strict=True)
+
+    return int(ckpt.get("step", 0))
 
 
 def tensor_to_bgr_uint8(x: torch.Tensor) -> np.ndarray:
-    """
-    x: 3xHxW in [-1,1]
-    return: HxWx3 BGR uint8
-    """
-    x = x.detach().float().cpu().clamp(-1, 1)
+    x = x.detach().float().cpu()
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1, 1)
     x = (x + 1.0) * 0.5
     x = x.permute(1, 2, 0).numpy()
     x = np.clip(x * 255.0, 0, 255).astype(np.uint8)
@@ -60,14 +77,7 @@ def make_debug_panel(identity: torch.Tensor, condition: torch.Tensor, recon: tor
     return np.hstack([id_img, cond_img, recon_img, clean_img])
 
 
-def save_debug_images(
-    out_dir: Path,
-    step: int,
-    epoch: int,
-    batch,
-    recon_images: torch.Tensor,
-    max_samples: int = 2,
-):
+def save_debug_images(out_dir: Path, step: int, epoch: int, batch, recon_images: torch.Tensor, max_samples: int = 1):
     debug_dir = out_dir / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -80,17 +90,14 @@ def save_debug_images(
             recon=recon_images[i],
             clean=batch["clean"][i],
         )
-        meta_h = 38
-        meta = np.full((meta_h, panel.shape[1], 3), 255, dtype=np.uint8)
+        meta = np.full((38, panel.shape[1], 3), 255, dtype=np.uint8)
         person_id = batch.get("person_id", [""] * n)[i] if isinstance(batch.get("person_id"), list) else ""
-        id_path = batch.get("identity_path", [""] * n)[i] if isinstance(batch.get("identity_path"), list) else ""
         txt = f"step={step} epoch={epoch} sample={i} person_id={person_id}"
         cv2.putText(meta, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 2, cv2.LINE_AA)
         rows.append(np.vstack([meta, panel]))
 
     canvas = rows[0] if len(rows) == 1 else np.vstack(rows)
-    save_path = debug_dir / f"step_{step:07d}.jpg"
-    cv2.imwrite(str(save_path), canvas)
+    cv2.imwrite(str(debug_dir / f"step_{step:07d}.jpg"), canvas)
 
 
 def main(args):
@@ -119,123 +126,225 @@ def main(args):
         device=device,
         dtype=dtype,
     )
+
+    if args.resume:
+        resumed_step = load_checkpoint(model, args.resume)
+        print(f"[RESUME] loaded {args.resume}, checkpoint step={resumed_step}")
+
     model.train()
     model.vae.eval()
     model.text_encoder.eval()
-    if not args.train_unet:
-        model.unet.eval()
+    model.unet.train(args.train_unet)
+
+    if args.gradient_checkpointing and hasattr(model.unet, "enable_gradient_checkpointing"):
+        model.unet.enable_gradient_checkpointing()
+        print("[INFO] UNet gradient checkpointing enabled")
+
+    id_loss_fn = None
+    if args.lambda_id > 0:
+        id_loss_fn = build_id_loss(
+            backend=args.id_loss_backend,
+            device=device,
+            model_path=args.id_loss_model,
+            facenet_pretrained=args.facenet_pretrained,
+            input_range=args.id_loss_input_range,
+        )
+        id_loss_fn.eval()
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
-    step = 0
+    grad_accum = max(1, int(args.grad_accum_steps))
+    opt.zero_grad(set_to_none=True)
+
+    global_step = 0
+    micro_step = 0
+    accum_count = 0
     num_debug_saved = 0
+    skipped_nonfinite = 0
 
     for epoch in range(args.epochs):
         pbar = tqdm(dl, desc=f"epoch {epoch}")
         for batch in pbar:
             clean = batch["clean"].to(device, non_blocking=True)
             cond = batch["condition"].to(device, non_blocking=True)
+            identity = batch["identity"].to(device, non_blocking=True)
+
             id_embed = batch.get("id_embed")
             if id_embed is not None:
                 id_embed = id_embed.to(device, non_blocking=True)
             else:
                 id_embed = torch.zeros((clean.shape[0], args.id_dim), device=device, dtype=torch.float32)
 
+            id_active = args.lambda_id > 0 and global_step >= args.id_loss_start_step
+            id_this_step = id_active and (micro_step % args.id_loss_every == 0)
+
             need_debug = (
                 args.debug_image_every > 0
-                and step % args.debug_image_every == 0
+                and micro_step % args.debug_image_every == 0
                 and num_debug_saved < args.debug_max_save
             )
+
             decode_recon = (
-                (args.lambda_recon > 0 and (step % args.recon_every == 0))
+                (args.lambda_recon > 0 and (micro_step % args.recon_every == 0))
+                or id_this_step
                 or need_debug
             )
 
-            out = model(
-                clean=clean,
-                condition=cond,
-                id_embed=id_embed,
-                prompt=args.prompt,
-                decode_recon=decode_recon,
-                fixed_high_timestep=args.fixed_high_timestep,
+            with torch.cuda.amp.autocast(enabled=args.fp16):
+                out = model(
+                    clean=clean,
+                    condition=cond,
+                    id_embed=id_embed,
+                    prompt=args.prompt,
+                    decode_recon=decode_recon,
+                    fixed_high_timestep=args.fixed_high_timestep,
+                )
+
+                loss_noise = noise_prediction_loss(out.model_pred, out.target, args.noise_loss)
+                loss_recon = reconstruction_l1_loss(out.recon_image, clean) if (out.recon_image is not None and args.lambda_recon > 0) else clean.new_tensor(0.0)
+
+            if id_loss_fn is not None and id_this_step and out.recon_image is not None:
+                # Keep ID model/loss in fp32 for stable cosine gradients.
+                with torch.cuda.amp.autocast(enabled=False):
+                    id_target = clean if args.id_loss_target == "clean" else identity
+                    loss_id = id_loss_fn(out.recon_image.float(), id_target.float())
+            else:
+                loss_id = clean.new_tensor(0.0)
+
+            loss = (
+                args.lambda_noise * loss_noise.float()
+                + args.lambda_recon * loss_recon.float()
+                + args.lambda_id * loss_id.float()
             )
 
-            loss_noise = noise_prediction_loss(out.model_pred, out.target, args.noise_loss)
-            loss_recon = reconstruction_l1_loss(out.recon_image, clean) if out.recon_image is not None else clean.new_tensor(0.0)
-            loss = args.lambda_noise * loss_noise + args.lambda_recon * loss_recon
+            if not torch.isfinite(loss):
+                skipped_nonfinite += 1
+                opt.zero_grad(set_to_none=True)
+                accum_count = 0
+                if need_debug and out.recon_image is not None:
+                    save_debug_images(out_dir, micro_step, epoch, batch, out.recon_image, args.debug_num_samples)
+                    num_debug_saved += 1
+                if micro_step % args.log_every == 0:
+                    pbar.set_postfix({
+                        "loss": "nonfinite_skip",
+                        "opt_step": global_step,
+                        "micro": micro_step,
+                        "skip": skipped_nonfinite,
+                    })
+                micro_step += 1
+                continue
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
-            opt.step()
+            scaler.scale(loss / grad_accum).backward()
+            accum_count += 1
 
-            if step % args.log_every == 0:
+            if need_debug and out.recon_image is not None:
+                save_debug_images(out_dir, micro_step, epoch, batch, out.recon_image, args.debug_num_samples)
+                num_debug_saved += 1
+
+            if accum_count >= grad_accum:
+                if args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad(set_to_none=True)
+
+                global_step += 1
+                accum_count = 0
+
+                if args.save_every > 0 and global_step > 0 and global_step % args.save_every == 0:
+                    save_checkpoint(model, out_dir, global_step)
+
+            if micro_step % args.log_every == 0:
                 pbar.set_postfix({
                     "loss": float(loss.item()),
                     "noise": float(loss_noise.item()),
                     "recon": float(loss_recon.item()),
+                    "id": float(loss_id.item()),
+                    "id_on": int(id_active),
+                    "opt_step": global_step,
+                    "accum": accum_count,
+                    "skip": skipped_nonfinite,
                 })
 
-            if need_debug and out.recon_image is not None:
-                save_debug_images(
-                    out_dir=out_dir,
-                    step=step,
-                    epoch=epoch,
-                    batch=batch,
-                    recon_images=out.recon_image,
-                    max_samples=args.debug_num_samples,
-                )
-                num_debug_saved += 1
-
-            if args.save_every > 0 and step > 0 and step % args.save_every == 0:
-                save_checkpoint(model, out_dir, step)
-
-            step += 1
-            if args.max_steps > 0 and step >= args.max_steps:
-                save_checkpoint(model, out_dir, step)
+            micro_step += 1
+            if args.max_steps > 0 and global_step >= args.max_steps:
+                if accum_count > 0:
+                    if args.grad_clip > 0:
+                        scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+                    scaler.step(opt)
+                    scaler.update()
+                    opt.zero_grad(set_to_none=True)
+                    global_step += 1
+                save_checkpoint(model, out_dir, global_step)
                 return
 
-    save_checkpoint(model, out_dir, step)
+    if accum_count > 0:
+        if args.grad_clip > 0:
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+        global_step += 1
+
+    save_checkpoint(model, out_dir, global_step)
 
 
 def build_parser():
-    p = argparse.ArgumentParser("Train MVFS blur-condition teacher")
-    p.add_argument("--index", required=True, help="teacher_index.jsonl")
+    p = argparse.ArgumentParser("Train MVFS blur-condition teacher with late ID loss")
+    p.add_argument("--index", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--pretrained", default="stabilityai/sd-turbo")
     p.add_argument("--device", default="cuda")
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--grad-accum-steps", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--max-steps", type=int, default=0)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--max-steps", type=int, default=65000, help="optimizer steps, not micro-batches")
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--weight-decay", type=float, default=1e-2)
+    p.add_argument("--weight-decay", type=float, default=1e-3)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--fp16", action="store_true")
-    p.add_argument("--train-unet", action="store_true", help="Not recommended for 12GB. Prefer adapter-only first.")
+    p.add_argument("--train-unet", action="store_true")
+    p.add_argument("--gradient-checkpointing", action="store_true")
+    p.add_argument("--resume", type=str, default="")
+
     p.add_argument("--id-dim", type=int, default=512)
     p.add_argument("--num-id-tokens", type=int, default=4)
     p.add_argument("--random-identity-same-dir", action="store_true")
     p.add_argument("--prompt", default="")
     p.add_argument("--fixed-high-timestep", type=int, default=999)
     p.add_argument("--noise-loss", default="mse", choices=["mse", "l1"])
+
     p.add_argument("--lambda-noise", type=float, default=1.0)
-    p.add_argument("--lambda-recon", type=float, default=0.1)
-    p.add_argument("--recon-every", type=int, default=4, help="Decode recon every N steps to save VRAM/time.")
+    p.add_argument("--lambda-recon", type=float, default=10.0)
+    p.add_argument("--lambda-id", type=float, default=1.0)
+
+    p.add_argument("--id-loss-start-step", type=int, default=50000, help="optimizer step at which ID loss starts")
+    p.add_argument("--id-loss-every", type=int, default=1)
+    p.add_argument("--id-loss-target", type=str, default="identity", choices=["identity", "clean"])
+    p.add_argument("--id-loss-backend", type=str, default="facenet", choices=["facenet", "torchscript"])
+    p.add_argument("--facenet-pretrained", type=str, default="vggface2")
+    p.add_argument("--id-loss-model", type=str, default="")
+    p.add_argument("--id-loss-input-range", type=str, default="minus1_1", choices=["minus1_1", "0_1", "imagenet"])
+
+    p.add_argument("--recon-every", type=int, default=1)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save-every", type=int, default=1000)
-
-    p.add_argument("--debug-image-every", type=int, default=100, help="Save debug panel every N steps. 0 disables.")
-    p.add_argument("--debug-max-save", type=int, default=200, help="Maximum number of debug files to save.")
-    p.add_argument("--debug-num-samples", type=int, default=1, help="How many samples to show per debug panel.")
+    p.add_argument("--debug-image-every", type=int, default=100)
+    p.add_argument("--debug-max-save", type=int, default=200)
+    p.add_argument("--debug-num-samples", type=int, default=1)
     return p
 
 

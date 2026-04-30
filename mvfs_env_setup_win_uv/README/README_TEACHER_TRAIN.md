@@ -1,105 +1,90 @@
-# MVFS Teacher Train Debug v2
+# MVFS Teacher Late ID Loss FaceNet v1
 
-## 지금 티처 학습 가능한가?
+## 결론
 
-가능하다. 전제는 아래 3개다.
+RTX 3060 12GB 기준 ID loss 모델은 일단 **facenet-pytorch InceptionResnetV1 pretrained=vggface2**로 선택했다.
 
-1. `workspace/general_teacher/meta/teacher_index.jsonl` 존재
-2. `workspace/general_teacher/conditions/blur_only/...` 존재
-3. `workspace/general_teacher/id_embeddings/*.npy` 존재
-
-즉 네가 앞에서 만든 A1/A2 -> teacher dataset 빌드가 끝났으면,
-이제 바로 teacher 학습을 돌릴 수 있다.
-
----
-
-## 이번 수정 내용
-
-### 1) 디버깅 이미지 저장
-학습 중 아래 순서로 패널 이미지를 저장한다.
+선택 이유:
 
 ```text
-ID | BLUR CONDITION | RECON | GT
+- PyTorch native라 recon -> ID loss -> UNet gradient가 흐름
+- ArcFace iresnet100 / Arc2Face / PulID보다 가벼움
+- RTX 3060 12GB에서 full UNet 학습과 같이 쓰기 현실적
+- 나중에 TorchScript ArcFace로 교체 가능
 ```
 
-저장 위치:
+## 학습 정책
+
+사용자 의도대로 **초반에는 ID loss를 쓰지 않고 후반부에만 사용**한다.
+
+기본값:
 
 ```text
-<teacher_workspace>/runs/<run_name>/debug/step_0000100.jpg
+max_steps          = 65000 optimizer steps
+id_loss_start_step = 50000
 ```
 
-### 2) ID 이미지 자동 추론
-`teacher_index.jsonl`에 `identity_path`가 없어도 괜찮다.
-
-학습용 Dataset이 자동으로:
+즉:
 
 ```text
-clean_path = .../<person_id>/A2/xxx.jpg
+0 ~ 49999 step:
+  noise + 10 * recon
+
+50000 ~ 65000 step:
+  noise + 10 * recon + 1 * id
 ```
 
-를 보고, 같은 person의:
+SD-Turbo 기반이라 timestep filtering은 넣지 않았다.
 
-```text
-.../<person_id>/A1/
+## 설치
+
+```bat
+bat\04_mvfs_install_idloss_facenet.bat
 ```
-
-에서 첫 번째 이미지를 찾아서 ID debug image로 사용한다.
-
-즉 지금 네 데이터 구조에서도 바로 동작한다.
-
----
-
-## 덮어쓸 파일
-
-```text
-datasets/teacher_blur_dataset.py
-train/train_teacher.py
-bat/26_teacher_train.bat
-```
-
----
 
 ## 실행
 
 ```bat
-bat\26_teacher_train.bat D:\MVFS\workspace\general_teacher teacher_run01
+bat\26_teacher_train_late_idloss_facenet.bat D:\MVFS\workspace\general_teacher late_idloss_run01
 ```
 
----
-
-## 출력 구조 예시
+## 기본 학습 설정
 
 ```text
-workspace/general_teacher/
-└─ runs/
-   └─ teacher_run01/
-      ├─ train_config.json
-      ├─ checkpoints/
-      │  ├─ teacher_adapters_step_0001000.pt
-      │  └─ ...
-      └─ debug/
-         ├─ step_0000000.jpg
-         ├─ step_0000100.jpg
-         └─ ...
+--train-unet
+--fp16
+--gradient-checkpointing
+--batch-size 1
+--grad-accum-steps 8
+--lr 1e-4
+--weight-decay 1e-3
+--lambda-noise 1.0
+--lambda-recon 10.0
+--lambda-id 1.0
+--id-loss-start-step 50000
 ```
 
----
+## TorchScript ArcFace로 바꾸고 싶을 때
 
-## 참고
+`facenet` 대신 직접 준비한 TorchScript 모델을 쓸 수 있다.
 
-- `--debug-image-every 100`
-  - 100 step마다 디버그 저장
-- `--debug-num-samples 1`
-  - 한 장에 몇 샘플을 넣을지
-- `--debug-max-save 200`
-  - 디버그 파일 최대 저장 개수
-- `--recon-every 4`
-  - recon decode 주기
+```bat
+python train\train_teacher.py ^
+  ... ^
+  --id-loss-backend torchscript ^
+  --id-loss-model D:\MVFS\pretrained\id\arcface_jit.pt ^
+  --id-loss-input-range minus1_1
+```
 
-디버그 이미지를 더 자주 보고 싶으면:
+## 주의
+
+기존 InsightFace ONNX buffalo_l은 계속 쓴다.
 
 ```text
---debug-image-every 20
-```
+ONNX buffalo_l:
+  A1 평균 ID embedding 생성
+  ID conditioning token용
 
-처럼 줄이면 된다.
+FaceNet/TorchScript:
+  recon image에 대한 differentiable ID loss용
+```
