@@ -1,7 +1,7 @@
 @echo off
 rem Common MVFS paths. This file is meant to be CALLed.
 
-set "MVFS_ROOT=%~dp0.."
+set "MVFS_ROOT=%~dp0..\.."
 for %%I in ("%MVFS_ROOT%") do set "MVFS_ROOT=%%~fI"
 
 if "%MVFS_VENV%"=="" set "MVFS_VENV=%MVFS_ROOT%\.venv-mvfs"

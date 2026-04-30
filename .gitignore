@@ -1,5 +1,6 @@
-weights/
 checkpoints/
+workspace/
 dataset/
-.venv
+weights/
+.venv-mvfs/
 .idea

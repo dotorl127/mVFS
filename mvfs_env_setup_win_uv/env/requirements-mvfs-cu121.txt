@@ -24,7 +24,7 @@ Pillow==10.4.0
 scipy==1.13.1
 scikit-image==0.24.0
 PyYAML==6.0.2
-tqdm==4.67.1
+tqdm
 matplotlib==3.9.2
 einops==0.8.0
 

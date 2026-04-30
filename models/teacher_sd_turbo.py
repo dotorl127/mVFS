@@ -89,8 +89,9 @@ class MVFSTeacherSDTurbo(nn.Module):
     def append_id_tokens(self, prompt_embeds: torch.Tensor, id_embed: Optional[torch.Tensor]) -> torch.Tensor:
         if id_embed is None:
             return prompt_embeds
-        id_embed = id_embed.to(device=self.device_name, dtype=prompt_embeds.dtype)
-        id_tokens = self.id_adapter(id_embed).to(dtype=prompt_embeds.dtype)
+        id_dtype = next(self.id_adapter.parameters()).dtype
+        id_embed = id_embed.to(device=self.device_name, dtype=id_dtype)
+        id_tokens = self.id_adapter(id_embed).to(device=self.device_name, dtype=prompt_embeds.dtype)
         return torch.cat([prompt_embeds, id_tokens], dim=1)
 
     def _prediction_target(self, latents: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
@@ -135,7 +136,15 @@ class MVFSTeacherSDTurbo(nn.Module):
             timesteps = timesteps.to(self.device_name).long()
 
         noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
-        pose_residual = self.pose_guider(condition.to(dtype=self.weight_dtype), latent_hw=noisy_latents.shape[-2:]).to(dtype=noisy_latents.dtype)
+
+        # pose_guider는 기본 float32 trainable module이므로,
+        # fp16 condition을 바로 넣으면 Conv bias dtype mismatch가 난다.
+        pose_dtype = next(self.pose_guider.parameters()).dtype
+        pose_residual = self.pose_guider(
+            condition.to(device=self.device_name, dtype=pose_dtype),
+            latent_hw=noisy_latents.shape[-2:],
+        ).to(dtype=noisy_latents.dtype)
+
         unet_input = noisy_latents + pose_residual
 
         with torch.no_grad():
