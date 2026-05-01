@@ -88,7 +88,7 @@ def safe_move_dir(src: Path, dst_root: Path) -> Path:
 
 def main():
     ap = argparse.ArgumentParser("Filter VGGFace2-HQ identities by DeepFace majority gender/race")
-    ap.add_argument("--src-root", default="D:\MVFS\dataset\vggface2-hq", required=True, help="VGGFace2-HQ root containing id directories")
+    ap.add_argument("--src-root", default="D:/MVFS/dataset/VGGFace2-HQ/1", help="VGGFace2-HQ root containing id directories")
     ap.add_argument("--kept-root", default="", help="Optional output root for kept ids. If empty, filter in-place.")
     ap.add_argument("--rejected-root", default="", help="Move rejected ids here. Recommended.")
     ap.add_argument("--delete-rejected", action="store_true", help="Actually delete rejected id directories. Dangerous.")
