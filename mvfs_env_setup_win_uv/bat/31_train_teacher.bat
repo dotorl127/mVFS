@@ -32,7 +32,7 @@ python "%MVFS_ROOT%\train\train_teacher.py" ^
   --fp16 ^
   --train-unet ^
   --gradient-checkpointing ^
-  --condition-channels 4 ^
+  --condition-channels 1 ^
   --landmark-sigma 2.0 ^
   --blur-downsample-size 32 ^
   --blur-gaussian-radius 0.0 ^
@@ -54,6 +54,6 @@ python "%MVFS_ROOT%\train\train_teacher.py" ^
   --save-every 100 ^
   --save-every-micro 0 ^
   --debug-image-every 10 ^
-  --debug-max-save 1000 ^
+  --debug-max-save 200 ^
   --debug-num-samples 1
 endlocal

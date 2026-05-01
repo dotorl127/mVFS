@@ -37,6 +37,8 @@ def save_checkpoint(model: MVFSTeacherSDTurbo, out_dir: Path, opt_step: int, mic
         "step": opt_step,
         "train_unet": train_unet,
         "condition_channels": getattr(model, "condition_channels", None),
+        "unet_input_channels": getattr(model, "unet_input_channels", None),
+        "base_latent_channels": getattr(model, "base_latent_channels", None),
     }
 
     if micro_step is None:
@@ -47,6 +49,40 @@ def save_checkpoint(model: MVFSTeacherSDTurbo, out_dir: Path, opt_step: int, mic
     torch.save(ckpt, ckpt_dir / name)
 
 
+def _load_unet_state_flexible(model: MVFSTeacherSDTurbo, state_dict: dict):
+    current = model.unet.state_dict()
+    patched = {}
+
+    for k, v in state_dict.items():
+        if k not in current:
+            continue
+        if current[k].shape == v.shape:
+            patched[k] = v
+            continue
+
+        if k == "conv_in.weight" and v.ndim == 4 and current[k].ndim == 4:
+            dst = current[k].clone()
+            dst.zero_()
+            out_c = min(dst.shape[0], v.shape[0])
+            in_c = min(dst.shape[1], v.shape[1])
+            kh = min(dst.shape[2], v.shape[2])
+            kw = min(dst.shape[3], v.shape[3])
+            dst[:out_c, :in_c, :kh, :kw] = v[:out_c, :in_c, :kh, :kw]
+            patched[k] = dst
+            continue
+
+        if k == "conv_in.bias" and v.ndim == 1 and current[k].ndim == 1:
+            dst = current[k].clone()
+            dst.zero_()
+            n = min(dst.shape[0], v.shape[0])
+            dst[:n] = v[:n]
+            patched[k] = dst
+            continue
+
+    missing, unexpected = model.unet.load_state_dict(patched, strict=False)
+    return missing, unexpected
+
+
 def load_checkpoint(model: MVFSTeacherSDTurbo, ckpt_path: str | Path):
     ckpt = torch.load(str(ckpt_path), map_location="cpu")
     if ckpt.get("pose_guider") is not None:
@@ -54,7 +90,9 @@ def load_checkpoint(model: MVFSTeacherSDTurbo, ckpt_path: str | Path):
     if ckpt.get("id_adapter") is not None:
         model.id_adapter.load_state_dict(ckpt["id_adapter"], strict=True)
     if ckpt.get("unet") is not None:
-        model.unet.load_state_dict(ckpt["unet"], strict=True)
+        missing, unexpected = _load_unet_state_flexible(model, ckpt["unet"])
+        if missing or unexpected:
+            print(f"[WARN] flexible UNet load: missing={len(missing)}, unexpected={len(unexpected)}")
     return int(ckpt.get("opt_step", ckpt.get("step", 0)))
 
 
@@ -99,7 +137,7 @@ def make_debug_panel(identity, condition_rgb, face_mask, landmark_map, recon, cl
     ])
 
 
-def save_debug_images(out_dir: Path, step: int, epoch: int, batch, recon_images: torch.Tensor, max_samples: int = 1):
+def save_debug_images(out_dir: Path, step: int, epoch: int, batch, recon_images: torch.Tensor, max_samples: int = 1, keep_last: int = 200):
     debug_dir = out_dir / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
@@ -130,9 +168,19 @@ def save_debug_images(out_dir: Path, step: int, epoch: int, batch, recon_images:
 
     cv2.imwrite(str(debug_dir / f"micro_{step:07d}.jpg"), rows[0] if len(rows) == 1 else np.vstack(rows))
 
+    if keep_last > 0:
+        files = sorted(debug_dir.glob("micro_*.jpg"), key=lambda p: p.stat().st_mtime)
+        excess = len(files) - keep_last
+        if excess > 0:
+            for p in files[:excess]:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
 
 def build_parser():
-    p = argparse.ArgumentParser("Train MVFS teacher with face-seg blur + 3DDFA landmark condition + LPIPS")
+    p = argparse.ArgumentParser("Train MVFS teacher with blur-latent concat + landmark pose guider + LPIPS")
     p.add_argument("--index", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--pretrained", default="stabilityai/sd-turbo")
@@ -151,7 +199,7 @@ def build_parser():
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--resume", type=str, default="")
 
-    p.add_argument("--condition-channels", type=int, default=4)
+    p.add_argument("--condition-channels", type=int, default=1, help="landmark map channels for PoseGuider")
     p.add_argument("--landmark-sigma", type=float, default=2.0)
     p.add_argument("--no-landmark-lines", action="store_true")
     p.add_argument("--blur-downsample-size", type=int, default=8)
@@ -271,7 +319,8 @@ def main(args):
         pbar = tqdm(dl, desc=f"ep{epoch}", dynamic_ncols=True, leave=True)
         for batch in pbar:
             clean = batch["clean"].to(device, non_blocking=True)
-            cond = batch["condition"].to(device, non_blocking=True)
+            blur_rgb = batch["blur_rgb"].to(device, non_blocking=True)
+            landmark_map = batch["landmark_map"].to(device, non_blocking=True)
             identity = batch["identity"].to(device, non_blocking=True)
             face_mask = batch["face_mask"].to(device, non_blocking=True)
 
@@ -283,13 +332,14 @@ def main(args):
 
             id_active = args.lambda_id > 0 and opt_step >= args.id_loss_start_step
             id_this_step = id_active and (micro_step % args.id_loss_every == 0)
-            need_debug = args.debug_image_every > 0 and micro_step % args.debug_image_every == 0 and num_debug_saved < args.debug_max_save
-            decode_recon = True  # L1/LPIPS/debug all need recon.
+            need_debug = args.debug_image_every > 0 and micro_step % args.debug_image_every == 0
+            decode_recon = True
 
             with torch.amp.autocast("cuda", enabled=args.fp16):
                 out = model(
                     clean=clean,
-                    condition=cond,
+                    blur_image=blur_rgb,
+                    landmark_map=landmark_map,
                     id_embed=id_embed,
                     prompt=args.prompt,
                     decode_recon=decode_recon,
@@ -298,9 +348,15 @@ def main(args):
                 loss_noise = noise_prediction_loss(out.model_pred, out.target, args.noise_loss)
 
             if out.recon_image is not None:
-                recon_face, gt_face = masked_blend_pair(out.recon_image.float(), clean.float(), face_mask.float())
-                loss_l1 = masked_l1(recon_face, gt_face, face_mask.float()) if args.lambda_l1 > 0 else clean.new_tensor(0.0)
-                loss_lpips = lpips_loss_fn(recon_face, gt_face) if lpips_loss_fn is not None else clean.new_tensor(0.0)
+                # recon_face, gt_face = masked_blend_pair(out.recon_image.float(), clean.float(), face_mask.float())
+                # loss_l1 = masked_l1(recon_face, gt_face, face_mask.float()) if args.lambda_l1 > 0 else clean.new_tensor(0.0)
+                # loss_lpips = lpips_loss_fn(recon_face, gt_face) if lpips_loss_fn is not None else clean.new_tensor(0.0)
+
+                recon_img = out.recon_image.float()
+                gt_img = clean.float()
+
+                loss_l1 = torch.nn.functional.l1_loss(recon_img, gt_img) if args.lambda_l1 > 0 else clean.new_tensor(0.0)
+                loss_lpips = lpips_loss_fn(recon_img, gt_img) if lpips_loss_fn is not None else clean.new_tensor(0.0)
             else:
                 loss_l1 = clean.new_tensor(0.0)
                 loss_lpips = clean.new_tensor(0.0)
@@ -324,7 +380,7 @@ def main(args):
                 opt.zero_grad(set_to_none=True)
                 accum_count = 0
                 if need_debug and out.recon_image is not None:
-                    save_debug_images(out_dir, micro_step, epoch, batch, out.recon_image, args.debug_num_samples)
+                    save_debug_images(out_dir, micro_step, epoch, batch, out.recon_image, args.debug_num_samples, keep_last=args.debug_max_save,)
                     num_debug_saved += 1
                 micro_step += 1
                 continue
@@ -333,7 +389,7 @@ def main(args):
             accum_count += 1
 
             if need_debug and out.recon_image is not None:
-                save_debug_images(out_dir, micro_step, epoch, batch, out.recon_image, args.debug_num_samples)
+                save_debug_images(out_dir, micro_step, epoch, batch, out.recon_image, args.debug_num_samples, keep_last=args.debug_max_save,)
                 num_debug_saved += 1
 
             if args.save_every_micro > 0 and micro_step > 0 and micro_step % args.save_every_micro == 0:
@@ -358,9 +414,9 @@ def main(args):
 
             if micro_step % args.log_every == 0:
                 pbar.set_postfix_str(
-                    f"L={loss.item():.3f} N={loss_noise.item():.3f} "
-                    f"L1={loss_l1.item():.3f} P={loss_lpips.item():.3f} "
-                    f"I={loss_id.item():.3f}"
+                    f"L={loss.item():.3f} "
+                    f"N={loss_noise.item():.3f} L1={loss_l1.item():.3f} "
+                    f"P={loss_lpips.item():.3f} I={loss_id.item():.3f}"
                     # f"id={int(id_active)} s={opt_step} a={accum_count} skip={skipped_nonfinite}"
                 )
 

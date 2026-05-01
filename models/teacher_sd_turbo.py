@@ -8,6 +8,7 @@ import torch.nn as nn
 from .pose_guider import PoseGuider
 from .id_adapter import IDAdapter
 
+
 @dataclass
 class TeacherOutput:
     model_pred: torch.Tensor
@@ -18,17 +19,24 @@ class TeacherOutput:
     pred_x0: Optional[torch.Tensor] = None
     recon_image: Optional[torch.Tensor] = None
 
+
 class MVFSTeacherSDTurbo(nn.Module):
     """
-    condition default:
-      4ch = blur RGB 3ch + projected 3DDFA landmark heatmap 1ch
+    Teacher 입력 구조 (수정 후)
+      - main latent branch : noisy clean latent x_t (4ch)
+      - pose branch        : landmark_map -> PoseGuider -> residual add (4ch)
+      - blur branch        : blur RGB -> VAE latent z_blur (4ch)
+      - final UNet input   : concat(x_t + pose_residual, z_blur) = 8ch
+      - ID branch          : id_embed -> IDAdapter -> extra cross-attention tokens
+
+    즉 landmark는 PoseGuider 전용, blur condition은 UNet 입력 concat 전용으로 분리된다.
     """
     def __init__(
         self,
         pretrained_model_name_or_path: str = "stabilityai/sd-turbo",
         id_dim: int = 512,
         num_id_tokens: int = 4,
-        condition_channels: int = 4,
+        condition_channels: int = 1,
         train_unet: bool = False,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
@@ -51,13 +59,16 @@ class MVFSTeacherSDTurbo(nn.Module):
         self.device_name = device
         self.weight_dtype = dtype
         self.condition_channels = int(condition_channels)
+        self.base_latent_channels = int(self.unet.config.in_channels)
+
+        self._expand_unet_conv_in(extra_in_channels=self.base_latent_channels)
 
         self.vae.requires_grad_(False)
         self.text_encoder.requires_grad_(False)
         self.unet.requires_grad_(train_unet)
 
         cross_dim = self.unet.config.cross_attention_dim
-        self.pose_guider = PoseGuider(in_channels=self.condition_channels, out_channels=self.unet.config.in_channels)
+        self.pose_guider = PoseGuider(in_channels=self.condition_channels, out_channels=self.base_latent_channels)
         self.id_adapter = IDAdapter(id_dim=id_dim, cross_attention_dim=cross_dim, num_tokens=num_id_tokens)
 
         self.to(device)
@@ -73,6 +84,34 @@ class MVFSTeacherSDTurbo(nn.Module):
             self.unet.to(device=device, dtype=torch.float32).train()
         else:
             self.unet.to(device=device, dtype=dtype).eval()
+
+    def _expand_unet_conv_in(self, extra_in_channels: int):
+        old_conv = self.unet.conv_in
+        old_in = int(old_conv.in_channels)
+        new_in = old_in + int(extra_in_channels)
+        if old_in == new_in:
+            return
+
+        new_conv = nn.Conv2d(
+            new_in,
+            old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        new_conv = new_conv.to(device=old_conv.weight.device, dtype=old_conv.weight.dtype)
+
+        with torch.no_grad():
+            new_conv.weight.zero_()
+            new_conv.weight[:, :old_in].copy_(old_conv.weight)
+            if old_conv.bias is not None:
+                new_conv.bias.copy_(old_conv.bias)
+
+        self.unet.conv_in = new_conv
+        self.unet.config.in_channels = new_in
+        self.unet.register_to_config(in_channels=new_in)
+        self.unet_input_channels = new_in
 
     @torch.no_grad()
     def encode_prompt(self, batch_size: int, prompt: str = "") -> torch.Tensor:
@@ -121,7 +160,7 @@ class MVFSTeacherSDTurbo(nn.Module):
     def predict_x0(self, noisy_latents: torch.Tensor, model_pred: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         outs = []
         for i in range(noisy_latents.shape[0]):
-            step_out = self.scheduler.step(model_pred[i:i+1], timesteps[i], noisy_latents[i:i+1], return_dict=True)
+            step_out = self.scheduler.step(model_pred[i:i + 1], timesteps[i], noisy_latents[i:i + 1], return_dict=True)
             outs.append(step_out.pred_original_sample)
         pred_x0 = torch.cat(outs, dim=0)
         return torch.nan_to_num(pred_x0.float(), nan=0.0, posinf=30.0, neginf=-30.0).clamp(-30, 30).to(dtype=noisy_latents.dtype)
@@ -129,7 +168,8 @@ class MVFSTeacherSDTurbo(nn.Module):
     def forward(
         self,
         clean: torch.Tensor,
-        condition: torch.Tensor,
+        blur_image: torch.Tensor,
+        landmark_map: torch.Tensor,
         id_embed: Optional[torch.Tensor] = None,
         timesteps: Optional[torch.Tensor] = None,
         prompt: str = "",
@@ -138,12 +178,19 @@ class MVFSTeacherSDTurbo(nn.Module):
     ) -> TeacherOutput:
         b = clean.shape[0]
         clean = clean.to(self.device_name)
-        condition = condition.to(self.device_name)
+        blur_image = blur_image.to(self.device_name)
+        landmark_map = landmark_map.to(self.device_name)
 
-        if condition.shape[1] != self.condition_channels:
-            raise ValueError(f"condition channel mismatch: got {condition.shape[1]}, expected {self.condition_channels}")
+        if blur_image.ndim != 4 or blur_image.shape[1] != 3:
+            raise ValueError(f"blur_image must be Bx3xHxW, got {tuple(blur_image.shape)}")
+        if landmark_map.ndim != 4 or landmark_map.shape[1] != self.condition_channels:
+            raise ValueError(
+                f"landmark_map channel mismatch: got {landmark_map.shape[1]}, expected {self.condition_channels}"
+            )
 
         latents = self.encode_images(clean)
+        blur_latents = self.encode_images(blur_image).to(dtype=latents.dtype)
+
         noise = torch.randn_like(latents)
         if timesteps is None:
             if fixed_high_timestep is not None:
@@ -157,9 +204,12 @@ class MVFSTeacherSDTurbo(nn.Module):
 
         pose_dtype = next(self.pose_guider.parameters()).dtype
         pose_residual = self.pose_guider(
-            condition.to(device=self.device_name, dtype=pose_dtype),
-            latent_hw=noisy_latents.shape[-2:], ).to(dtype=noisy_latents.dtype)
-        unet_input = noisy_latents + pose_residual
+            landmark_map.to(device=self.device_name, dtype=pose_dtype),
+            latent_hw=noisy_latents.shape[-2:],
+        ).to(dtype=noisy_latents.dtype)
+
+        latent_with_pose = noisy_latents + pose_residual
+        unet_input = torch.cat([latent_with_pose, blur_latents], dim=1)
 
         with torch.no_grad():
             text_dtype = next(self.text_encoder.parameters()).dtype

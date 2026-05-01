@@ -130,15 +130,16 @@ def render_landmark_condition(
 
 class TeacherBlurDataset(Dataset):
     """
-    On-the-fly APPLE-style teacher condition:
-      clean A2 DFLJPG
-      + sidecar face segmentation mask
-      -> face-only blur condition
-      + projected 3DDFA landmark heatmap
-      -> 4ch condition tensor
+    Teacher sample 구성:
+      - clean        : A2 clean GT (-1~1)
+      - blur_rgb     : 얼굴 영역만 blur 처리한 APPLE-style condition RGB (-1~1)
+      - landmark_map : projected 2D 3DDFA landmark heatmap (0~1, 1ch)
+      - identity     : A1 identity image (-1~1)
+      - face_mask    : debug / optional masked loss 용 (0~1, 1ch)
 
-    Returned debug fields:
-      condition_rgb, landmark_map, face_mask
+    핵심 변경점:
+      * 더 이상 blur_rgb와 landmark_map을 dataset에서 합쳐서 "condition" 4ch로 반환하지 않음.
+      * blur_rgb는 UNet 입력 concat용, landmark_map은 PoseGuider 전용으로 분리 반환.
     """
 
     def __init__(
@@ -202,7 +203,7 @@ class TeacherBlurDataset(Dataset):
         if face_mask is None:
             face_mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
 
-        cond_rgb = build_face_blur_condition_rgb(
+        blur_bgr = build_face_blur_condition_rgb(
             clean_bgr,
             face_mask,
             downsample_size=self.blur_downsample_size,
@@ -212,8 +213,8 @@ class TeacherBlurDataset(Dataset):
 
         clean = torch.from_numpy(cv2.cvtColor(clean_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
         clean = clean * 2.0 - 1.0
-        condition_rgb = torch.from_numpy(cond_rgb.astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
-        condition_rgb = condition_rgb * 2.0 - 1.0
+        blur_rgb = torch.from_numpy(cv2.cvtColor(blur_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0).permute(2, 0, 1).contiguous()
+        blur_rgb = blur_rgb * 2.0 - 1.0
         identity = _read_image_rgb(identity_path, self.image_size)
 
         lm = load_projected_3ddfa_landmarks_2d(clean_path)
@@ -230,13 +231,12 @@ class TeacherBlurDataset(Dataset):
                 draw_lines=self.landmark_draw_lines,
             )
 
-        condition = torch.cat([condition_rgb, landmark_map * 2.0 - 1.0], dim=0)
         face_mask_t = torch.from_numpy(face_mask.astype(np.float32) / 255.0)[None]
 
         sample = {
             "clean": clean,
-            "condition": condition,
-            "condition_rgb": condition_rgb,
+            "blur_rgb": blur_rgb,
+            "condition_rgb": blur_rgb,  # debug/backward-compat alias
             "landmark_map": landmark_map,
             "face_mask": face_mask_t,
             "identity": identity,

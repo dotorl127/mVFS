@@ -26,9 +26,8 @@ def build_face_blur_condition_rgb(
     Returns RGB uint8 image.
     """
     h, w = img_bgr.shape[:2]
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-    pil_img = Image.fromarray(img_rgb)
+    pil_img = Image.fromarray(img_bgr)
     if downsample_size > 0:
         low = pil_img.resize((int(downsample_size), int(downsample_size)), Image.BILINEAR)
         up = low.resize((w, h), Image.BILINEAR)
@@ -47,5 +46,5 @@ def build_face_blur_condition_rgb(
         mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=feather_sigma, sigmaY=feather_sigma)
         mask = np.clip(mask, 0.0, 1.0)
 
-    cond = img_rgb.astype(np.float32) * (1.0 - mask[..., None]) + blur_np.astype(np.float32) * mask[..., None]
+    cond = img_bgr.astype(np.float32) * (1.0 - mask[..., None]) + blur_np.astype(np.float32) * mask[..., None]
     return np.clip(cond, 0, 255).astype(np.uint8)
