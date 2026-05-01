@@ -459,9 +459,9 @@ def build_parser():
     p.add_argument("--a2-name", default="A2", type=str)
     p.add_argument("--recursive", action="store_true")
 
-    p.add_argument("--downsample", default=8, type=int)
+    p.add_argument("--downsample", default=32, type=int)
     p.add_argument("--expand", default=0.20, type=float)
-    p.add_argument("--blur-sigma", default=2, type=float)
+    p.add_argument("--blur-sigma", default=0, type=float)
     p.add_argument("--feather-sigma", default=8.0, type=float)
     p.add_argument("--blur-whole-image", action="store_true")
     p.add_argument("--debug", action="store_true")

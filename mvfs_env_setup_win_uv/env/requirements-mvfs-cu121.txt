@@ -1,6 +1,6 @@
-# MVFS main env: Python 3.10, Windows 11, NVIDIA GPU, CUDA 12.x wheel stack.
-# Install with:
-#   uv pip install -r env\requirements-mvfs-cu121.txt
+# MVFS main env
+# Python: 3.10
+# CUDA wheel stack: cu121
 
 --extra-index-url https://download.pytorch.org/whl/cu121
 
@@ -8,7 +8,6 @@ torch==2.4.1+cu121
 torchvision==0.19.1+cu121
 torchaudio==2.4.1+cu121
 
-# SD-Turbo / LoRA / training
 diffusers==0.32.2
 transformers==4.46.3
 accelerate==1.1.1
@@ -17,7 +16,6 @@ peft==0.13.2
 huggingface_hub==0.26.2
 tokenizers==0.20.3
 
-# Image / numeric
 numpy==1.26.4
 opencv-python==4.10.0.84
 Pillow==10.4.0
@@ -28,11 +26,13 @@ tqdm
 matplotlib==3.9.2
 einops==0.8.0
 
-# InsightFace / ONNX GPU
 onnx==1.17.0
 onnxruntime-gpu==1.20.1
 insightface==0.7.3
 
-# Useful
+lpips==0.1.4
+facexlib==0.3.0
+basicsr==1.4.2
+
 tensorboard==2.18.0
 rich==13.9.4
