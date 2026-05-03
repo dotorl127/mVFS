@@ -1,6 +1,6 @@
-checkpoints/
 workspace/
 dataset/
-weights/
 .venv-mvfs/
+.venv-gaze/
+assets/
 .idea

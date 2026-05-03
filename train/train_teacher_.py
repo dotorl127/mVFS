@@ -9,7 +9,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -21,48 +20,7 @@ from datasets.teacher_blur_dataset import TeacherBlurDataset
 from models.teacher_sd_turbo import MVFSTeacherSDTurbo
 from losses.diffusion_losses import noise_prediction_loss
 from losses.id_loss import build_id_loss
-from losses.lpips_loss import LPIPSLoss
-
-
-
-def moving_average(values, window: int):
-    if window <= 1 or len(values) < 2:
-        return list(values)
-    out = []
-    for i in range(len(values)):
-        s = max(0, i - window + 1)
-        out.append(float(np.mean(values[s:i + 1])))
-    return out
-
-
-def save_loss_plot(loss_history: list[dict], out_path: Path, window: int = 50):
-    # CSV는 저장하지 않고 PNG 그림만 갱신한다.
-    if len(loss_history) < 2:
-        return
-
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"[WARN] loss plot skipped: {e}")
-        return
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    x = np.asarray([r["opt_step"] for r in loss_history], dtype=np.float32)
-
-    plt.figure(figsize=(12, 7))
-    for name in ["loss", "noise", "recon", "lpips", "id"]:
-        y = np.asarray([r.get(name, 0.0) for r in loss_history], dtype=np.float32)
-        y_ma = moving_average(y.tolist(), window)
-        plt.plot(x, y_ma, label=f"{name}_ma{window}")
-
-    plt.xlabel("optimizer step")
-    plt.ylabel("loss")
-    plt.title("MVFS Teacher Loss")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
+from losses.lpips_loss import LPIPSLoss, masked_blend_pair, masked_l1
 
 
 def save_checkpoint(
@@ -74,7 +32,6 @@ def save_checkpoint(
     opt_step: int,
     micro_step: int,
     accum_count: int = 0,
-    loss_history: list[dict] | None = None,
 ):
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -171,7 +128,6 @@ def load_checkpoint(model: MVFSTeacherSDTurbo, ckpt_path: str | Path, opt=None, 
         "opt_step": int(ckpt.get("opt_step", ckpt.get("step", 0))),
         "micro_step": int(ckpt.get("micro_step", 0)),
         "accum_count": int(ckpt.get("accum_count", 0)),
-        "loss_history": ckpt.get("loss_history", []),
     }
 
 
@@ -302,15 +258,13 @@ def build_parser():
     p.add_argument("--id-loss-model", type=str, default="")
     p.add_argument("--id-loss-input-range", type=str, default="minus1_1", choices=["minus1_1", "0_1", "imagenet"])
 
-    p.add_argument("--lpips-net", type=str, default="vgg", choices=["alex", "vgg", "squeeze"])
+    p.add_argument("--lpips-net", type=str, default="alex", choices=["alex", "vgg", "squeeze"])
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save-every", type=int, default=1000, help="optimizer-step checkpoint interval")
     p.add_argument("--save-every-micro", type=int, default=0, help="optional micro-step checkpoint interval")
     p.add_argument("--debug-image-every", type=int, default=100)
     p.add_argument("--debug-max-save", type=int, default=200, help="keep last N debug images")
     p.add_argument("--debug-num-samples", type=int, default=1)
-    p.add_argument("--loss-plot-every", type=int, default=100, help="optimizer step 기준 loss graph PNG 저장 주기")
-    p.add_argument("--loss-log-window", type=int, default=50, help="moving average window for loss graph")
     return p
 
 
@@ -389,9 +343,6 @@ def main(args):
     with open(out_dir / "train_config.json", "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
-    loss_plot_path = out_dir / "logs" / "loss_plot.png"
-    loss_history = list(resume_state.get("loss_history", []))
-
     grad_accum = max(1, int(args.grad_accum_steps))
     opt.zero_grad(set_to_none=True)
 
@@ -433,15 +384,12 @@ def main(args):
                 )
                 loss_noise = noise_prediction_loss(out.model_pred, out.target, args.noise_loss)
 
-            # 변경점: face_mask 영역이 아니라 전체 이미지에서 recon/LPIPS loss 계산.
             if out.recon_image is not None:
-                recon_full = out.recon_image.float()
-                gt_full = clean.float()
-                # loss_l1 = F.l1_loss(recon_full, gt_full) if args.lambda_l1 > 0 else clean.new_tensor(0.0)
-                loss_l2 = F.mse_loss(recon_full, gt_full) if args.lambda_l1 > 0 else clean.new_tensor(0.0)
-                loss_lpips = lpips_loss_fn(recon_full, gt_full) if lpips_loss_fn is not None else clean.new_tensor(0.0)
+                recon_face, gt_face = masked_blend_pair(out.recon_image.float(), clean.float(), face_mask.float())
+                loss_l1 = masked_l1(recon_face, gt_face, face_mask.float()) if args.lambda_l1 > 0 else clean.new_tensor(0.0)
+                loss_lpips = lpips_loss_fn(recon_face, gt_face) if lpips_loss_fn is not None else clean.new_tensor(0.0)
             else:
-                loss_l2 = clean.new_tensor(0.0)
+                loss_l1 = clean.new_tensor(0.0)
                 loss_lpips = clean.new_tensor(0.0)
 
             if id_loss_fn is not None and id_this_step and out.recon_image is not None:
@@ -453,7 +401,7 @@ def main(args):
 
             loss = (
                 args.lambda_noise * loss_noise.float()
-                + args.lambda_l1 * loss_l2.float()
+                + args.lambda_l1 * loss_l1.float()
                 + args.lambda_lpips * loss_lpips.float()
                 + args.lambda_id * loss_id.float()
             )
@@ -500,28 +448,12 @@ def main(args):
                     print(f"[SAVE] opt={opt_step}, micro={micro_step}, epoch={epoch}")
 
             if micro_step % args.log_every == 0:
-                loss_row = {
-                    "epoch": int(epoch),
-                    "micro_step": int(micro_step),
-                    "opt_step": int(opt_step),
-                    "loss": float(loss.item()),
-                    "noise": float(loss_noise.item()),
-                    "recon": float(loss_l2.item()),
-                    "lpips": float(loss_lpips.item()),
-                    "id": float(loss_id.item()),
-                    "id_active": int(id_active),
-                }
-                loss_history.append(loss_row)
-
                 pbar.set_postfix_str(
-                    f"L={loss_row['loss']:.3f} "
-                    f"N={loss_row['noise']:.3f} R={loss_row['recon']:.3f} "
-                    f"P={loss_row['lpips']:.3f} I={loss_row['id']:.3f} "
-                    # f"id={loss_row['id_active']} s={opt_step} a={accum_count} skip={skipped_nonfinite}"
+                    f"L={loss.item():.3f} N={loss_noise.item():.3f} "
+                    f"L1={loss_l1.item():.3f} P={loss_lpips.item():.3f} "
+                    f"I={loss_id.item():.3f} id={int(id_active)} "
+                    f"s={opt_step} a={accum_count} skip={skipped_nonfinite}"
                 )
-
-                if args.loss_plot_every > 0 and opt_step > 0 and opt_step % args.loss_plot_every == 0:
-                    save_loss_plot(loss_history, loss_plot_path, window=args.loss_log_window)
 
             micro_step += 1
 

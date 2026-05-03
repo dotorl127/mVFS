@@ -13,6 +13,7 @@ from torch.utils.data import Dataset
 
 from mvfs_common.dfljpg_utils import read_dfljpg_metadata
 from mvfs_common.blur_condition import build_face_blur_condition_rgb
+from mvfs_common.gaze_utils import append_gaze_to_landmarks_2d
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -108,6 +109,11 @@ def render_landmark_condition(
     sigma: float = 2.0,
     draw_lines: bool = True,
 ) -> torch.Tensor:
+    """
+    landmarks는 68점 3DDFA 뒤에 gaze iris 10점이 추가되어도 됨.
+    선은 기존 68점 chain만 그리고, 모든 점에는 gaussian을 찍는다.
+    따라서 gaze 10점은 선 연결 없이 점으로만 들어간다.
+    """
     lm = np.asarray(landmarks, dtype=np.float32)
     heat = np.zeros((image_size, image_size), np.float32)
 
@@ -118,7 +124,7 @@ def render_landmark_condition(
         list(range(48, 60)) + [48], list(range(60, 68)) + [60],
     ]
 
-    if draw_lines:
+    if draw_lines and lm.shape[0] >= 68:
         for ch in chains:
             _draw_polyline_heat(heat, lm[ch, :2], thickness=max(1, int(round(sigma))))
 
@@ -133,13 +139,9 @@ class TeacherBlurDataset(Dataset):
     Teacher sample 구성:
       - clean        : A2 clean GT (-1~1)
       - blur_rgb     : 얼굴 영역만 blur 처리한 APPLE-style condition RGB (-1~1)
-      - landmark_map : projected 2D 3DDFA landmark heatmap (0~1, 1ch)
+      - landmark_map : projected 2D 3DDFA landmark + gaze iris 5+5 heatmap (0~1, 1ch)
       - identity     : A1 identity image (-1~1)
       - face_mask    : debug / optional masked loss 용 (0~1, 1ch)
-
-    핵심 변경점:
-      * 더 이상 blur_rgb와 landmark_map을 dataset에서 합쳐서 "condition" 4ch로 반환하지 않음.
-      * blur_rgb는 UNet 입력 concat용, landmark_map은 PoseGuider 전용으로 분리 반환.
     """
 
     def __init__(
@@ -222,8 +224,23 @@ class TeacherBlurDataset(Dataset):
             landmark_map = torch.zeros((1, self.image_size, self.image_size), dtype=torch.float32)
         else:
             lm = lm.copy()
-            lm[:, 0] *= float(self.image_size) / float(orig_w)
-            lm[:, 1] *= float(self.image_size) / float(orig_h)
+
+            sx = float(self.image_size) / float(orig_w)
+            sy = float(self.image_size) / float(orig_h)
+
+            lm[:, 0] *= sx
+            lm[:, 1] *= sy
+
+            # 핵심 변경점:
+            # clean_path 옆의 .mvfs_gaze.json에서 iris 5+5점을 읽어
+            # 3DDFA landmarks 뒤에 그대로 append한다.
+            lm = append_gaze_to_landmarks_2d(
+                image_path=clean_path,
+                landmarks_2d=lm,
+                scale_x=sx,
+                scale_y=sy,
+            )
+
             landmark_map = render_landmark_condition(
                 lm,
                 self.image_size,
@@ -236,7 +253,7 @@ class TeacherBlurDataset(Dataset):
         sample = {
             "clean": clean,
             "blur_rgb": blur_rgb,
-            "condition_rgb": blur_rgb,  # debug/backward-compat alias
+            "condition_rgb": blur_rgb,
             "landmark_map": landmark_map,
             "face_mask": face_mask_t,
             "identity": identity,

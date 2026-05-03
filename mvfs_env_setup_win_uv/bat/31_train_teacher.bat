@@ -8,7 +8,7 @@ if "%~1"=="" (
 set "WS=%~1"
 set "RUN_NAME=%~2"
 if "%RUN_NAME%"=="" set "RUN_NAME=teacher_run01"
-
+31  
 call "%~dp0_mvfs_activate.bat"
 if not %errorlevel%==0 exit /b 1
 
@@ -42,18 +42,19 @@ python "%MVFS_ROOT%\train\train_teacher.py" ^
   --fixed-high-timestep 999 ^
   --noise-loss mse ^
   --lambda-noise 1.0 ^
-  --lambda-l1 10.0 ^
+  --lambda-l1 2.0 ^
   --lambda-lpips 1.0 ^
   --lambda-id 1.0 ^
   --id-loss-start-step 50000 ^
   --id-loss-backend facenet ^
   --facenet-pretrained vggface2 ^
   --id-loss-target identity ^
-  --lpips-net alex ^
+  --lpips-net vgg ^
   --log-every 10 ^
   --save-every 100 ^
   --save-every-micro 0 ^
   --debug-image-every 10 ^
   --debug-max-save 200 ^
-  --debug-num-samples 1
+  --debug-num-samples 1 ^
+  --resume D:/MVFS/workspace/general_teacher/runs/teacher_run01/checkpoints/latest.pt
 endlocal
