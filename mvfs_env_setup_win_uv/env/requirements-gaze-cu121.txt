@@ -1,0 +1,9 @@
+# MVFS main env
+# Python: 3.10
+# CUDA wheel stack: cu121
+
+numpy
+opencv-python
+tqdm
+protobuf>=4.25.3,<5
+mediapipe==0.10.21
