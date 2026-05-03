@@ -239,6 +239,8 @@ class TeacherBlurDataset(Dataset):
                 landmarks_2d=lm,
                 scale_x=sx,
                 scale_y=sy,
+                target_w=self.image_size,
+                target_h=self.image_size,
             )
 
             landmark_map = render_landmark_condition(

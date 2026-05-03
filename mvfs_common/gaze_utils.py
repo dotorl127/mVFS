@@ -176,13 +176,15 @@ def append_gaze_to_landmarks_2d(
     landmarks_2d: np.ndarray,
     scale_x: float = 1.0,
     scale_y: float = 1.0,
+    target_w: int | None = None,
+    target_h: int | None = None,
 ) -> np.ndarray:
     """
-    기존 3DMM/3DDFA 2D landmarks 뒤에 MediaPipe iris 10점을 그대로 추가한다.
-    즉 최종 landmark array:
-        [3dmm landmarks..., left_iris_5, right_iris_5]
+    기존 3DMM/3DDFA 2D landmarks 뒤에 MediaPipe iris 10점을 append.
 
-    sidecar gaze 좌표는 원본 이미지 기준이므로, dataset resize 비율을 같이 적용한다.
+    중요:
+      gaze json의 image_size를 우선 기준으로 삼아서 target size로 스케일한다.
+      이렇게 해야 dataset resize와 sidecar 좌표계가 확실히 맞는다.
     """
     lm = np.asarray(landmarks_2d, dtype=np.float32)
     gaze = load_gaze_sidecar(image_path)
@@ -192,7 +194,22 @@ def append_gaze_to_landmarks_2d(
         return lm
 
     gaze_pts = gaze_pts.copy()
-    gaze_pts[:, 0] *= float(scale_x)
-    gaze_pts[:, 1] *= float(scale_y)
+
+    if target_w is not None and target_h is not None and gaze is not None:
+        src_size = gaze.get("image_size", None)
+        if src_size is not None and len(src_size) >= 2:
+            src_w, src_h = float(src_size[0]), float(src_size[1])
+            if src_w > 0 and src_h > 0:
+                gaze_pts[:, 0] *= float(target_w) / src_w
+                gaze_pts[:, 1] *= float(target_h) / src_h
+            else:
+                gaze_pts[:, 0] *= float(scale_x)
+                gaze_pts[:, 1] *= float(scale_y)
+        else:
+            gaze_pts[:, 0] *= float(scale_x)
+            gaze_pts[:, 1] *= float(scale_y)
+    else:
+        gaze_pts[:, 0] *= float(scale_x)
+        gaze_pts[:, 1] *= float(scale_y)
 
     return np.concatenate([lm, gaze_pts], axis=0).astype(np.float32)
